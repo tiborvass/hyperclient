@@ -1,0 +1,18 @@
+This is a HyperDex client package for Go.
+It is a wrapper around the C hyperclient provided by HyperDex.
+
+For more information about HyperDex, please go to http://hyperdex.org.
+
+-- NOTE
+This is still a work in progress.
+
+-- LICENSE
+I don't provide any license, so you can use this source code as you want with no warranties whatsoever.
+However do not violate HyperDex's own license available here : https://raw.github.com/rescrv/HyperDex/master/LICENSE
+
+-- PREREQUESITES
+Download hyperdex at http://hyperdex.org/download/
+Install hyperdex (make sure you have the dynamic libraries installed properly)
+
+-- INSTALL
+go get -u github.com/tiborvass/hyperclient
