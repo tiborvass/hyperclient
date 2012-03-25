@@ -18,7 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
-	"unsafe"
+	"unsafe" // used only for C.GoBytes
 )
 
 // CHANNEL_BUFFER_SIZE is the size of all the returned channels' buffer.
@@ -102,6 +102,7 @@ type Attributes map[string]interface{}
 type Object struct {
 	Key   string
 	Attrs Attributes
+	Err   error
 }
 
 type ObjectChannel <-chan *Object
@@ -197,44 +198,39 @@ func (client *Client) AtomicDec(space, key string, attrs Attributes) ErrorChanne
 	return client.atomicIncDec(space, key, attrs, true)
 }
 
-func (client *Client) Get(space, key string) (ObjectChannel, ErrorChannel) {
-	errch := make(chan error, CHANNEL_BUFFER_SIZE)
+func (client *Client) Get(space, key string) ObjectChannel {
 	objch := make(chan *Object, CHANNEL_BUFFER_SIZE)
 	var status C.enum_hyperclient_returncode
 	var C_attrs *C.struct_hyperclient_attribute
 	var C_attrs_sz C.size_t
 	req_id := int64(C.hyperclient_get(client.ptr, C.CString(space), C.CString(key), C.size_t(len([]byte(key))), &status, &C_attrs, &C_attrs_sz))
 	if req_id < 0 {
-		errch <- newInternalError(status)
-		close(errch)
+		objch <- &Object{Err: newInternalError(status)}
 		close(objch)
-		return objch, errch
+		return objch
 	}
 	req := request{
 		req_id,
 		objch,
-		errch,
+		nil,
 		bundle{"key": key, "status": &status, "C_attrs": &C_attrs, "C_attrs_sz": &C_attrs_sz},
 		func(req request) {
 			C_attrs := *req.bundle["C_attrs"].(**C.struct_hyperclient_attribute)
 			C_attrs_sz := *req.bundle["C_attrs_sz"].(*C.size_t)
 			attrs, err := newAttributeListFromC(C_attrs, C_attrs_sz)
 			if err != nil {
-				req.errch <- err
-				close(req.errch)
+				req.objch <- &Object{Err: err}
 				close(req.objch)
 				return
 			}
 			C.hyperclient_destroy_attrs(C_attrs, C_attrs_sz)
-			req.objch <- &Object{req.bundle["key"].(string), attrs}
-			req.errch <- nil
+			req.objch <- &Object{req.bundle["key"].(string), attrs, nil}
 			close(req.objch)
-			close(req.errch)
 		},
 		failureTwoChannels,
 	}
 	client.requests = append(client.requests, req)
-	return objch, errch
+	return objch
 }
 
 func (client *Client) Delete(space, key string) ErrorChannel {
@@ -269,15 +265,15 @@ func newInternalError(status C.enum_hyperclient_returncode, a ...interface{}) er
 func (client *Client) atomicIncDec(space, key string, attrs Attributes, negative bool) ErrorChannel {
 	errch := make(chan error, CHANNEL_BUFFER_SIZE)
 	var status C.enum_hyperclient_returncode
-	C_attr, err := getOneCTypeAttribute(attrs, negative)
+	C_attrs, C_attrs_sz, err := newCTypeAttributeList(attrs, negative)
 	if err != nil {
 		errch <- err
 		close(errch)
 		return errch
 	}
-	req_id := int64(C.hyperclient_atomicinc(client.ptr, C.CString(space), C.CString(key), C.size_t(len(key)), C_attr, C.size_t(1), &status))
+	req_id := int64(C.hyperclient_atomicinc(client.ptr, C.CString(space), C.CString(key), C.size_t(len(key)), C_attrs, C_attrs_sz, &status))
 	if req_id < 0 {
-		errch <- newInternalError(status, C.GoString(C_attr.attr))
+		errch <- newInternalError(status)
 		close(errch)
 		return errch
 	}
@@ -304,20 +300,20 @@ func failureTwoChannels(req request, status C.enum_hyperclient_returncode) {
 	close(req.objch)
 }
 
-func newCTypeAttributeList(attrs Attributes) (ret *C.struct_hyperclient_attribute, size uint, err error) {
-	C_attrs := make([]C.struct_hyperclient_attribute, len(attrs))
+func newCTypeAttributeList(attrs Attributes, negative bool) (C_attrs *C.struct_hyperclient_attribute, C_attrs_sz C.size_t, err error) {
+	slice := make([]C.struct_hyperclient_attribute, len(attrs))
 	for key, value := range attrs {
-		attr, err := newCTypeAttribute(key, value, false)
+		attr, err := newCTypeAttribute(key, value, negative)
 		if err != nil {
 			return nil, 0, err
 		}
-		C_attrs = append(C_attrs, *attr)
-		size += 1
+		slice = append(slice, *attr)
+		C_attrs_sz += 1
 	}
-	if size == 0 {
-		return nil, size, nil
+	if C_attrs_sz == 0 {
+		return nil, C_attrs_sz, nil
 	}
-	return &C_attrs[0], size, nil
+	return &slice[0], C_attrs_sz, nil
 }
 
 func newCTypeAttribute(key string, value interface{}, negative bool) (*C.struct_hyperclient_attribute, error) {
@@ -376,13 +372,6 @@ func newCTypeAttribute(key string, value interface{}, negative bool) (*C.struct_
 		C.enum_hyperclient_returncode(datatype),
 		[4]byte{}, // alignment
 	}, nil
-}
-
-func getOneCTypeAttribute(attrs Attributes, negative bool) (*C.struct_hyperclient_attribute, error) {
-	for key, value := range attrs {
-		return newCTypeAttribute(key, value, negative)
-	}
-	return nil, fmt.Errorf("Could not retrieve one CTypeAttribute from %v", attrs)
 }
 
 func newAttributeListFromC(C_attrs *C.struct_hyperclient_attribute, C_attrs_sz C.size_t) (attrs Attributes, err error) {
