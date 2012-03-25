@@ -110,11 +110,12 @@ type ErrorChannel <-chan error
 type bundle map[string]interface{}
 
 type request struct {
-	id       int64
-	objch    chan *Object
-	errch    chan error
-	bundle   bundle
-	callback func(request)
+	id      int64
+	objch   chan *Object
+	errch   chan error
+	bundle  bundle
+	success func(request)
+	failure func(request, C.enum_hyperclient_returncode)
 }
 
 // NewClient initializes a hyperdex client ready to use.
@@ -156,18 +157,15 @@ func NewClient(ip string, port int) (*Client, error) {
 					if ret < 0 && status != returncode_TIMEOUT {
 						panic(newInternalError(status).Error())
 					}
-					// loop through pending requests
+					// find processed request among pending requests
 					for i, req := range client.requests {
 						if req.id == ret {
 							if status == returncode_SUCCESS {
-								// execute callback
-								req.callback(req)
-								// tell request sender ♫ It's al'right Maaa... ♫
-								req.errch <- nil
+								req.success(req)
 							} else {
-								req.errch <- newInternalError(status)
+								req.failure(req, status)
 							}
-							// remove processed request
+							// remove processed request from pending requests
 							client.requests = append(client.requests[:i], client.requests[i+1:]...)
 							break
 						}
@@ -208,6 +206,8 @@ func (client *Client) Get(space, key string) (ObjectChannel, ErrorChannel) {
 	req_id := int64(C.hyperclient_get(client.ptr, C.CString(space), C.CString(key), C.size_t(len([]byte(key))), &status, &C_attrs, &C_attrs_sz))
 	if req_id < 0 {
 		errch <- newInternalError(status)
+		close(errch)
+		close(objch)
 		return objch, errch
 	}
 	req := request{
@@ -221,12 +221,17 @@ func (client *Client) Get(space, key string) (ObjectChannel, ErrorChannel) {
 			attrs, err := newAttributeListFromC(C_attrs, C_attrs_sz)
 			if err != nil {
 				req.errch <- err
-				req.objch <- nil
+				close(req.errch)
+				close(req.objch)
 				return
 			}
 			C.hyperclient_destroy_attrs(C_attrs, C_attrs_sz)
 			req.objch <- &Object{req.bundle["key"].(string), attrs}
+			req.errch <- nil
+			close(req.objch)
+			close(req.errch)
 		},
+		failureTwoChannels,
 	}
 	client.requests = append(client.requests, req)
 	return objch, errch
@@ -238,6 +243,7 @@ func (client *Client) Delete(space, key string) ErrorChannel {
 	req_id := int64(C.hyperclient_del(client.ptr, C.CString(space), C.CString(key), C.size_t(len([]byte(key))), &status))
 	if req_id < 0 {
 		errch <- newInternalError(status)
+		close(errch)
 		return errch
 	}
 	req := request{
@@ -246,6 +252,7 @@ func (client *Client) Delete(space, key string) ErrorChannel {
 		errch,
 		nil,
 		nil,
+		failureOneChannel,
 	}
 	client.requests = append(client.requests, req)
 	return errch
@@ -265,11 +272,13 @@ func (client *Client) atomicIncDec(space, key string, attrs Attributes, negative
 	C_attr, err := getOneCTypeAttribute(attrs, negative)
 	if err != nil {
 		errch <- err
+		close(errch)
 		return errch
 	}
 	req_id := int64(C.hyperclient_atomicinc(client.ptr, C.CString(space), C.CString(key), C.size_t(len(key)), C_attr, C.size_t(1), &status))
 	if req_id < 0 {
 		errch <- newInternalError(status, C.GoString(C_attr.attr))
+		close(errch)
 		return errch
 	}
 	req := request{
@@ -278,9 +287,21 @@ func (client *Client) atomicIncDec(space, key string, attrs Attributes, negative
 		errch,
 		nil,
 		nil,
+		failureOneChannel,
 	}
 	client.requests = append(client.requests, req)
 	return errch
+}
+
+func failureOneChannel(req request, status C.enum_hyperclient_returncode) {
+	req.errch <- newInternalError(status)
+	close(req.errch)
+}
+
+func failureTwoChannels(req request, status C.enum_hyperclient_returncode) {
+	req.errch <- newInternalError(status)
+	close(req.errch)
+	close(req.objch)
 }
 
 func newCTypeAttributeList(attrs Attributes) (ret *C.struct_hyperclient_attribute, size uint, err error) {
