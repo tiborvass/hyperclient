@@ -16,6 +16,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	//"log"
 	"runtime"
 	"unsafe" // used only for C.GoBytes
 )
@@ -26,7 +27,7 @@ var CHANNEL_BUFFER_SIZE = 1
 
 // Timeout in miliseconds.
 // Negative timeout means no timeout.
-const hyperclient_loop_timeout = -1
+var TIMEOUT = -1
 
 const (
 	datatype_STRING  = 8960
@@ -99,19 +100,19 @@ type Client struct {
 type Attributes map[string]interface{}
 
 type Object struct {
+	Err   error
 	Key   string
 	Attrs Attributes
-	Err   error
 }
 
-type ObjectChannel <-chan *Object
+type ObjectChannel <-chan Object
 type ErrorChannel <-chan error
 
 type bundle map[string]interface{}
 
 type request struct {
 	id       int64
-	objch    chan *Object
+	objch    chan Object
 	errch    chan error
 	bundle   bundle
 	success  func(request)
@@ -134,7 +135,7 @@ type request struct {
 //		// use client
 func NewClient(ip string, port int) (*Client, error) {
 	C_client := C.hyperclient_create(C.CString(ip), C.in_port_t(port))
-	fmt.Printf("hyperclient_create(\"%s\", %d) -> %X\n", ip, port, unsafe.Pointer(C_client))
+	//log.Printf("hyperclient_create(\"%s\", %d) -> %X\n", ip, port, unsafe.Pointer(C_client))
 	if C_client == nil {
 		return nil, fmt.Errorf("Could not create hyperclient (ip=%s, port=%d)", ip, port)
 	}
@@ -155,9 +156,9 @@ func NewClient(ip string, port int) (*Client, error) {
 				// and only if there are, call hyperclient_loop
 				if l := len(client.requests); l > 0 {
 					var status C.enum_hyperclient_returncode
-					ret := int64(C.hyperclient_loop(client.ptr, hyperclient_loop_timeout, &status))
-					fmt.Printf("hyperclient_loop(%X, %d, %X) -> %d\n", unsafe.Pointer(client.ptr), hyperclient_loop_timeout, unsafe.Pointer(&status), ret)
-					if ret < 0 && status != returncode_TIMEOUT {
+					ret := int64(C.hyperclient_loop(client.ptr, C.int(TIMEOUT), &status))
+					//log.Printf("hyperclient_loop(%X, %d, %X) -> %d\n", unsafe.Pointer(client.ptr), hyperclient_loop_timeout, unsafe.Pointer(&status), ret)
+					if ret < 0 {
 						panic(newInternalError(status).Error())
 					}
 					// find processed request among pending requests
@@ -193,7 +194,7 @@ func NewClient(ip string, port int) (*Client, error) {
 func (client *Client) Destroy() {
 	close(client.closeChan)
 	C.hyperclient_destroy(client.ptr)
-	fmt.Printf("hyperclient_destroy(%X)\n", unsafe.Pointer(client.ptr))
+	//log.Printf("hyperclient_destroy(%X)\n", unsafe.Pointer(client.ptr))
 }
 
 func (client *Client) AtomicInc(space, key string, attrs Attributes) ErrorChannel {
@@ -205,40 +206,41 @@ func (client *Client) AtomicDec(space, key string, attrs Attributes) ErrorChanne
 }
 
 func (client *Client) Get(space, key string) ObjectChannel {
-	objch := make(chan *Object, CHANNEL_BUFFER_SIZE)
+	objch := make(chan Object, CHANNEL_BUFFER_SIZE)
 	var status C.enum_hyperclient_returncode
 	var C_attrs *C.struct_hyperclient_attribute
-	var C_attrs_sz C.size_t
+	var C_attrs_sz C.size_t = 42
 	req_id := int64(C.hyperclient_get(client.ptr, C.CString(space), C.CString(key), C.size_t(len([]byte(key))), &status, &C_attrs, &C_attrs_sz))
-	fmt.Printf("hyperclient_get(%X, \"%s\", \"%s\", %d, %X, %X, %X) -> %d\n", unsafe.Pointer(client.ptr), space, key, len([]byte(key)), unsafe.Pointer(&status), unsafe.Pointer(&C_attrs), unsafe.Pointer(&C_attrs_sz), req_id)
+	//log.Printf("hyperclient_get(%X, \"%s\", \"%s\", %d, %X, %X, %X) -> %d\n", unsafe.Pointer(client.ptr), space, key, len([]byte(key)), unsafe.Pointer(&status), unsafe.Pointer(&C_attrs), unsafe.Pointer(&C_attrs_sz), req_id)
 	if req_id < 0 {
-		objch <- &Object{Err: newInternalError(status)}
+		objch <- Object{Err: newInternalError(status)}
 		close(objch)
 		return objch
 	}
 	req := request{
-		req_id,
-		objch,
-		nil,
-		bundle{"key": key, "status": &status, "C_attrs": &C_attrs, "C_attrs_sz": &C_attrs_sz},
-		func(req request) {
+		id:     req_id,
+		objch:  objch,
+		bundle: bundle{"key": key, "status": &status, "C_attrs": &C_attrs, "C_attrs_sz": &C_attrs_sz},
+		success: func(req request) {
 			C_attrs := *req.bundle["C_attrs"].(**C.struct_hyperclient_attribute)
 			C_attrs_sz := *req.bundle["C_attrs_sz"].(*C.size_t)
 			attrs, err := newAttributeListFromC(C_attrs, C_attrs_sz)
 			if err != nil {
-				req.objch <- &Object{Err: err}
+				req.objch <- Object{Err: err}
 				close(req.objch)
 				return
 			}
-			req.objch <- &Object{req.bundle["key"].(string), attrs, nil}
+			req.objch <- Object{Err: nil, Key: req.bundle["key"].(string), Attrs: attrs}
 			close(req.objch)
 		},
-		failureObjChannel,
-		func(req request) {
+		failure: objChannelFailureCallback,
+		complete: func(req request) {
 			C_attrs := *req.bundle["C_attrs"].(**C.struct_hyperclient_attribute)
 			C_attrs_sz := *req.bundle["C_attrs_sz"].(*C.size_t)
-			fmt.Printf("hyperclient_destroy_attrs(%X, %d)\n", unsafe.Pointer(C_attrs), C_attrs_sz)
-			C.hyperclient_destroy_attrs(C_attrs, C_attrs_sz)
+			if C_attrs_sz > 0 {
+				C.hyperclient_destroy_attrs(C_attrs, C_attrs_sz)
+				//log.Printf("hyperclient_destroy_attrs(%X, %d)\n", unsafe.Pointer(C_attrs), C_attrs_sz)
+			}
 		},
 	}
 	client.requests = append(client.requests, req)
@@ -249,30 +251,19 @@ func (client *Client) Delete(space, key string) ErrorChannel {
 	errch := make(chan error, CHANNEL_BUFFER_SIZE)
 	var status C.enum_hyperclient_returncode
 	req_id := int64(C.hyperclient_del(client.ptr, C.CString(space), C.CString(key), C.size_t(len([]byte(key))), &status))
+	//log.Printf("hyperclient_del(%X, \"%s\", \"%s\", %d, %X) -> %d", unsafe.Pointer(client.ptr), space, key, len([]byte(key)), unsafe.Pointer(&status), req_id)
 	if req_id < 0 {
 		errch <- newInternalError(status)
 		close(errch)
 		return errch
 	}
 	req := request{
-		req_id,
-		nil,
-		errch,
-		nil,
-		nil,
-		failureErrChannel,
-		nil,
+		id:      req_id,
+		errch:   errch,
+		failure: errChannelFailureCallback,
 	}
 	client.requests = append(client.requests, req)
 	return errch
-}
-
-func newInternalError(status C.enum_hyperclient_returncode, a ...interface{}) error {
-	s, ok := internalErrorMessages[int64(status)]
-	if ok {
-		return fmt.Errorf(s, a)
-	}
-	return errors.New("Unknown Error (file a bug)")
 }
 
 func (client *Client) atomicIncDec(space, key string, attrs Attributes, negative bool) ErrorChannel {
@@ -291,25 +282,29 @@ func (client *Client) atomicIncDec(space, key string, attrs Attributes, negative
 		return errch
 	}
 	req := request{
-		req_id,
-		nil,
-		errch,
-		nil,
-		nil,
-		failureErrChannel,
-		nil,
+		id:      req_id,
+		errch:   errch,
+		failure: errChannelFailureCallback,
 	}
 	client.requests = append(client.requests, req)
 	return errch
 }
 
-func failureErrChannel(req request, status C.enum_hyperclient_returncode) {
+func newInternalError(status C.enum_hyperclient_returncode, a ...interface{}) error {
+	s, ok := internalErrorMessages[int64(status)]
+	if ok {
+		return fmt.Errorf(s, a)
+	}
+	return errors.New("Unknown Error (file a bug)")
+}
+
+func errChannelFailureCallback(req request, status C.enum_hyperclient_returncode) {
 	req.errch <- newInternalError(status)
 	close(req.errch)
 }
 
-func failureObjChannel(req request, status C.enum_hyperclient_returncode) {
-	req.objch <- &Object{Err: newInternalError(status)}
+func objChannelFailureCallback(req request, status C.enum_hyperclient_returncode) {
+	req.objch <- Object{Err: newInternalError(status)}
 	close(req.objch)
 }
 
