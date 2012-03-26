@@ -227,7 +227,7 @@ func (client *Client) Get(space, key string) ObjectChannel {
 			req.objch <- &Object{req.bundle["key"].(string), attrs, nil}
 			close(req.objch)
 		},
-		failureTwoChannels,
+		failureObjChannel,
 	}
 	client.requests = append(client.requests, req)
 	return objch
@@ -248,7 +248,7 @@ func (client *Client) Delete(space, key string) ErrorChannel {
 		errch,
 		nil,
 		nil,
-		failureOneChannel,
+		failureErrChannel,
 	}
 	client.requests = append(client.requests, req)
 	return errch
@@ -283,20 +283,19 @@ func (client *Client) atomicIncDec(space, key string, attrs Attributes, negative
 		errch,
 		nil,
 		nil,
-		failureOneChannel,
+		failureErrChannel,
 	}
 	client.requests = append(client.requests, req)
 	return errch
 }
 
-func failureOneChannel(req request, status C.enum_hyperclient_returncode) {
+func failureErrChannel(req request, status C.enum_hyperclient_returncode) {
 	req.errch <- newInternalError(status)
 	close(req.errch)
 }
 
-func failureTwoChannels(req request, status C.enum_hyperclient_returncode) {
-	req.errch <- newInternalError(status)
-	close(req.errch)
+func failureObjChannel(req request, status C.enum_hyperclient_returncode) {
+	req.objch <- &Object{Err: newInternalError(status)}
 	close(req.objch)
 }
 
