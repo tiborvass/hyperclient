@@ -8,7 +8,6 @@ package hyperclient
 struct hyperclient_attribute* GetAttribute(struct hyperclient_attribute* list, int i) {
 	return &list[i];
 }
-
 */
 import "C"
 
@@ -111,12 +110,13 @@ type ErrorChannel <-chan error
 type bundle map[string]interface{}
 
 type request struct {
-	id      int64
-	objch   chan *Object
-	errch   chan error
-	bundle  bundle
-	success func(request)
-	failure func(request, C.enum_hyperclient_returncode)
+	id       int64
+	objch    chan *Object
+	errch    chan error
+	bundle   bundle
+	success  func(request)
+	failure  func(request, C.enum_hyperclient_returncode)
+	complete func(request)
 }
 
 // NewClient initializes a hyperdex client ready to use.
@@ -134,6 +134,7 @@ type request struct {
 //		// use client
 func NewClient(ip string, port int) (*Client, error) {
 	C_client := C.hyperclient_create(C.CString(ip), C.in_port_t(port))
+	fmt.Printf("hyperclient_create(\"%s\", %d) -> %X\n", ip, port, unsafe.Pointer(C_client))
 	if C_client == nil {
 		return nil, fmt.Errorf("Could not create hyperclient (ip=%s, port=%d)", ip, port)
 	}
@@ -155,6 +156,7 @@ func NewClient(ip string, port int) (*Client, error) {
 				if l := len(client.requests); l > 0 {
 					var status C.enum_hyperclient_returncode
 					ret := int64(C.hyperclient_loop(client.ptr, hyperclient_loop_timeout, &status))
+					fmt.Printf("hyperclient_loop(%X, %d, %X) -> %d\n", unsafe.Pointer(client.ptr), hyperclient_loop_timeout, unsafe.Pointer(&status), ret)
 					if ret < 0 && status != returncode_TIMEOUT {
 						panic(newInternalError(status).Error())
 					}
@@ -165,6 +167,9 @@ func NewClient(ip string, port int) (*Client, error) {
 								req.success(req)
 							} else {
 								req.failure(req, status)
+							}
+							if req.complete != nil {
+								req.complete(req)
 							}
 							// remove processed request from pending requests
 							client.requests = append(client.requests[:i], client.requests[i+1:]...)
@@ -188,6 +193,7 @@ func NewClient(ip string, port int) (*Client, error) {
 func (client *Client) Destroy() {
 	close(client.closeChan)
 	C.hyperclient_destroy(client.ptr)
+	fmt.Printf("hyperclient_destroy(%X)\n", unsafe.Pointer(client.ptr))
 }
 
 func (client *Client) AtomicInc(space, key string, attrs Attributes) ErrorChannel {
@@ -204,6 +210,7 @@ func (client *Client) Get(space, key string) ObjectChannel {
 	var C_attrs *C.struct_hyperclient_attribute
 	var C_attrs_sz C.size_t
 	req_id := int64(C.hyperclient_get(client.ptr, C.CString(space), C.CString(key), C.size_t(len([]byte(key))), &status, &C_attrs, &C_attrs_sz))
+	fmt.Printf("hyperclient_get(%X, \"%s\", \"%s\", %d, %X, %X, %X) -> %d\n", unsafe.Pointer(client.ptr), space, key, len([]byte(key)), unsafe.Pointer(&status), unsafe.Pointer(&C_attrs), unsafe.Pointer(&C_attrs_sz), req_id)
 	if req_id < 0 {
 		objch <- &Object{Err: newInternalError(status)}
 		close(objch)
@@ -223,11 +230,16 @@ func (client *Client) Get(space, key string) ObjectChannel {
 				close(req.objch)
 				return
 			}
-			C.hyperclient_destroy_attrs(C_attrs, C_attrs_sz)
 			req.objch <- &Object{req.bundle["key"].(string), attrs, nil}
 			close(req.objch)
 		},
 		failureObjChannel,
+		func(req request) {
+			C_attrs := *req.bundle["C_attrs"].(**C.struct_hyperclient_attribute)
+			C_attrs_sz := *req.bundle["C_attrs_sz"].(*C.size_t)
+			fmt.Printf("hyperclient_destroy_attrs(%X, %d)\n", unsafe.Pointer(C_attrs), C_attrs_sz)
+			C.hyperclient_destroy_attrs(C_attrs, C_attrs_sz)
+		},
 	}
 	client.requests = append(client.requests, req)
 	return objch
@@ -249,6 +261,7 @@ func (client *Client) Delete(space, key string) ErrorChannel {
 		nil,
 		nil,
 		failureErrChannel,
+		nil,
 	}
 	client.requests = append(client.requests, req)
 	return errch
@@ -284,6 +297,7 @@ func (client *Client) atomicIncDec(space, key string, attrs Attributes, negative
 		nil,
 		nil,
 		failureErrChannel,
+		nil,
 	}
 	client.requests = append(client.requests, req)
 	return errch
@@ -300,7 +314,7 @@ func failureObjChannel(req request, status C.enum_hyperclient_returncode) {
 }
 
 func newCTypeAttributeList(attrs Attributes, negative bool) (C_attrs *C.struct_hyperclient_attribute, C_attrs_sz C.size_t, err error) {
-	slice := make([]C.struct_hyperclient_attribute, len(attrs))
+	slice := make([]C.struct_hyperclient_attribute, 0, len(attrs))
 	for key, value := range attrs {
 		attr, err := newCTypeAttribute(key, value, negative)
 		if err != nil {
