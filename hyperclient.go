@@ -14,7 +14,6 @@ import "C"
 import (
 	"bytes"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	//"log"
 	"runtime"
@@ -155,7 +154,7 @@ func NewClient(ip string, port int) (*Client, error) {
 				// check if there are pending requests
 				// and only if there are, call hyperclient_loop
 				if l := len(client.requests); l > 0 {
-					var status C.enum_hyperclient_returncode
+					var status C.enum_hyperclient_returncode = 42
 					ret := int64(C.hyperclient_loop(client.ptr, C.int(TIMEOUT), &status))
 					//log.Printf("hyperclient_loop(%X, %d, %X) -> %d\n", unsafe.Pointer(client.ptr), hyperclient_loop_timeout, unsafe.Pointer(&status), ret)
 					if ret < 0 {
@@ -209,7 +208,7 @@ func (client *Client) Get(space, key string) ObjectChannel {
 	objch := make(chan Object, CHANNEL_BUFFER_SIZE)
 	var status C.enum_hyperclient_returncode
 	var C_attrs *C.struct_hyperclient_attribute
-	var C_attrs_sz C.size_t = 42
+	var C_attrs_sz C.size_t
 	req_id := int64(C.hyperclient_get(client.ptr, C.CString(space), C.CString(key), C.size_t(len([]byte(key))), &status, &C_attrs, &C_attrs_sz))
 	//log.Printf("hyperclient_get(%X, \"%s\", \"%s\", %d, %X, %X, %X) -> %d\n", unsafe.Pointer(client.ptr), space, key, len([]byte(key)), unsafe.Pointer(&status), unsafe.Pointer(&C_attrs), unsafe.Pointer(&C_attrs_sz), req_id)
 	if req_id < 0 {
@@ -295,7 +294,7 @@ func newInternalError(status C.enum_hyperclient_returncode, a ...interface{}) er
 	if ok {
 		return fmt.Errorf(s, a)
 	}
-	return errors.New("Unknown Error (file a bug)")
+	return fmt.Errorf("Unknown Error %d (file a bug)", status)
 }
 
 func errChannelFailureCallback(req request, status C.enum_hyperclient_returncode) {
